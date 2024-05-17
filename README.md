@@ -274,7 +274,7 @@ Preferences>Advanced>Network>Settings
 * 您可以自由修改手册目录中的文件。例如，出于良好的模块化考虑，您可以将缓存函数实现为名为 cache.c 和 cache.h 的库文件。当然，添加新文件你需要更新 Makefile。
 
 
-* 正如教材第677页的旁注重所讨论的，你的代理必须忽略 SIGPIPE 信号，并且应该优雅地处理返回 EPIPE 错误的写操作。
+* 正如教材第677页的旁注中所讨论的，你的代理必须忽略 SIGPIPE 信号，并且应该优雅地处理返回 EPIPE 错误的写操作。
 
 * 有时，调用 read 从已经提前关闭的套接字接收字节会导致 read 返回 -1，同时 errno 设置为 ECONNRESET。您的代理也不应因此错误而终止。
 
@@ -282,13 +282,13 @@ Preferences>Advanced>Network>Settings
 
 * 所有请求都将以HTTP/1.0协议转发，即使原始请求是 HTTP/1.1。
 
-### 7. 提交
+## 7. 提交
 
 运行以下命令
 ```
 make handin
 ```
-将会将proxylab目录打包，在proxylab的父目录下生成proxylab.tar文件，将proxylab.tar文件提交至响应位置。
+将会将proxylab目录打包，在proxylab的父目录下生成proxylab.tar文件，将proxylab.tar文件提交至相应位置。
 
 
 
