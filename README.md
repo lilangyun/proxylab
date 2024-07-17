@@ -288,7 +288,7 @@ Preferences>Advanced>Network>Settings
 ```
 make handin
 ```
-将会将proxylab目录打包，在proxylab的父目录下生成proxylab.tar文件，将proxylab.tar文件提交至相应位置。
+将会将proxylab目录打包，在proxylab的父目录下生成proxylab.zip文件，将proxylab.zip文件提交至相应位置。
 
 
 
