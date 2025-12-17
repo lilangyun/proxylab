@@ -30,12 +30,12 @@ int main(int argc, char **argv)
 	exit(1);
     }
 
-    listenfd = Open_listenfd(argv[1]);
+    listenfd = Open_listenfd(argv[1]);  //端口号是第2个参数
     while (1) {
 	clientlen = sizeof(clientaddr);
 	connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); //line:netp:tiny:accept
         Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, 
-                    port, MAXLINE, 0);
+                    port, MAXLINE, 0);  //接受到用户连接之后，转为hostname和port
         printf("Accepted connection from (%s, %s)\n", hostname, port);
 	doit(connfd);                                             //line:netp:tiny:doit
 	Close(connfd);                                            //line:netp:tiny:close
@@ -56,17 +56,18 @@ void doit(int fd)
     rio_t rio;
 
     /* Read request line and headers */
-    Rio_readinitb(&rio, fd);
+    Rio_readinitb(&rio, fd);  //初始化rio，fd为连接到listenfd的connfd，用于与客户端通信
     if (!Rio_readlineb(&rio, buf, MAXLINE))  //line:netp:doit:readrequest
-        return;
+        return;  //读取一行数据，如果没有输入则返回0
     printf("%s", buf);
     sscanf(buf, "%s %s %s", method, uri, version);       //line:netp:doit:parserequest
     if (strcasecmp(method, "GET")) {                     //line:netp:doit:beginrequesterr
         clienterror(fd, method, "501", "Not Implemented",
                     "Tiny does not implement this method");
-        return;
+        return;  //确保只运行GET事务
     }                                                    //line:netp:doit:endrequesterr
     read_requesthdrs(&rio);                              //line:netp:doit:readrequesthdrs
+    // 这个函数是web与proxy的一个区别，对proxy来讲是可以设置host作为根目录的
 
     /* Parse URI from GET request */
     is_static = parse_uri(uri, filename, cgiargs);       //line:netp:doit:staticcheck
