@@ -23,7 +23,7 @@ typedef struct {
     char uri[MAXLINE];
     char buf[MAX_OBJECT_SIZE];
     int n;  //buf的字节大小
-    int timelamp;  // 时间戳：实现LRU算法
+    int timestamp;  // 时间戳：实现LRU算法
 }Act;  // 每个活动
 
 typedef struct {
@@ -33,7 +33,7 @@ typedef struct {
 
 static Cache cache;
 static sem_t mutex, w;
-static int readcnt, timelamp;
+static int readcnt, timestamp;
 
 
 void doit(int fd);
@@ -43,15 +43,17 @@ void build_header(char *server, URI* uri_data, rio_t *rio);
 
 void *thread(void *connfdp);  // 线程例程函数
 
+/* 初始化cache */
 void init_cache(){
     cache.num = 0;
     for(int i = 0; i < MAX_OBJECT_NUM; i++){
         cache.act[i].n = 0;
+        cache.act[i].timestamp = 0;
     }
     Sem_init(&mutex, 0, 1);
     Sem_init(&w, 0, 1);
     readcnt = 0;  // 读者数为0
-    timelamp = 0;
+    timestamp = 0;
 }
 
 // 查看cache
@@ -66,10 +68,10 @@ int query_cache(int connfd, char *uri){
     /* 查找 */
     int hit_flag = 0; 
     for(int i = 0; i < MAX_OBJECT_NUM; i++){
-        if(!strcmp(cache.act[i].uri, uri)){
+        if( (cache.act[i].n) && (!strcmp(cache.act[i].uri, uri)) ){
             // 直接发给客户端
             P(&mutex);
-            cache.act[i].timelamp = timelamp++;
+            cache.act[i].timestamp = timestamp++;
             V(&mutex);
             Rio_writen(connfd, cache.act[i].buf, cache.act[i].n);
             hit_flag = 1;
@@ -91,24 +93,24 @@ int query_cache(int connfd, char *uri){
 
 /* 写cache */
 void write_cache(char *uri, char *buf, int n){
-    P(&w);
-    if(cache.num < MAX_OBJECT_NUM){
+    P(&w);  // 上锁-无法再有thread写入cache
+    if(cache.num < MAX_OBJECT_NUM){  
         int id = cache.num;
         memcpy(cache.act[id].buf, buf, n);
         strcpy(cache.act[id].uri, uri);
         cache.act[id].n = n;
-        P(&mutex);
-        cache.act[id].timelamp = timelamp++;
-        V(&mutex);
+        P(&mutex);  //  上互斥锁
+        cache.act[id].timestamp = timestamp++;  //  更改时间戳
+        V(&mutex);  //  解锁
         cache.num ++;
     }
     else{
         // 采用LRU替换策略
-        int longest_lamp = timelamp;
+        int min_stamp = timestamp;
         int idx;
         for(int i = 0; i < MAX_OBJECT_NUM; i++){
-            if(cache.act[i].timelamp < longest_lamp){
-                longest_lamp = cache.act[i].timelamp;
+            if(cache.act[i].timestamp < min_stamp){
+                min_stamp = cache.act[i].timestamp;  //  最小的说明最后一次访问最早
                 idx = i;
             }
         }
@@ -116,7 +118,7 @@ void write_cache(char *uri, char *buf, int n){
         strcpy(cache.act[idx].uri, uri);
         cache.act[idx].n = n;
         P(&mutex);
-        cache.act[idx].timelamp = timelamp++;
+        cache.act[idx].timestamp = timestamp++;
         V(&mutex);
     }
     V(&w);
@@ -135,8 +137,8 @@ int main(int argc, char **argv)
 
     /* Check command line args */
     if (argc != 2) {
-	fprintf(stderr, "usage: %s <port>\n", argv[0]);
-	exit(1);
+	    fprintf(stderr, "usage: %s <port>\n", argv[0]);
+	    exit(1);
     }
 
     /* cache初始化 */
@@ -145,7 +147,7 @@ int main(int argc, char **argv)
     listenfd = Open_listenfd(argv[1]);
     while (1) {
 	    clientlen = sizeof(clientaddr);
-        connfdp = Malloc(sizeof(int));  // 这里每次重新分配内存理论上应该可以避免race问题
+        connfdp = Malloc(sizeof(int));  // 消除竞争
         *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen);  //line:netp:tiny:accept
         Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", hostname, port);
@@ -162,10 +164,11 @@ void doit(int fd)
 {
     int is_static;  //表示是否为静态内容
     struct stat sbuf;
-    char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
+    char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE], tmp[MAXLINE];
     char server[MAXLINE];  //转发给server的数据
     rio_t rio, server_rio;
     char cache_buf[MAX_OBJECT_SIZE];
+
 
     /* Read request line and headers */
     Rio_readinitb(&rio, fd);  // connfd是用户与proxy进行connect的套接字
@@ -184,10 +187,12 @@ void doit(int fd)
     }
 
     // 解析uri
+    memcpy(tmp, uri, MAXLINE);
     URI *uri_data=Malloc(sizeof(URI));
-    parse_uri(uri, uri_data);
+    parse_uri(uri, uri_data);  // 此时uri已经被破坏
+    memcpy(uri, tmp, MAXLINE);  // 重新给
 
-    // 设置header
+    // 设置http_header
     build_header(server, uri_data, &rio);  //从用户connfd套接字读取数据
 
     // 连接服务器
@@ -197,19 +202,24 @@ void doit(int fd)
         return ;
     }
 
-    // 转发给服务器
+    // 将请求转发给服务器
     Rio_readinitb(&server_rio, serverfd);
     Rio_writen(serverfd, server, strlen(server));
 
     // 回复给客户端
-    size_t n, cnt = 0;
-    while((n = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0){
+    size_t n;
+    int cnt = 0;
+    while((n = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0){  //  读取二进制文件[如jepg图片]最好用rio_read
         printf("Proxy received %d bytes, then send\n", (int)n);
-        memcpy(cache_buf + cnt, buf, n);
+        // 在max_objective_size范围内复制给cache_buf
+        if( (cnt + n) < MAX_OBJECT_SIZE){
+            memcpy(cache_buf + cnt, buf, n);
+        }
         cnt += n;
         Rio_writen(fd, buf, n);
     }
 
+    // 缓存web对象
     if(cnt < MAX_OBJECT_SIZE){
         write_cache(uri, cache_buf, cnt);
     }
