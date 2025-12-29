@@ -5,17 +5,35 @@
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 
+/* About Cache */
+#define MAX_OBJECT_NUM 10
+
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
 static const char *user_connect_hdr = "Connection: close\r\n";
 static const char *user_proxy_hdr = "Proxy-Connection: close\r\n";
 
-
 typedef struct {
     char hostname[MAXLINE];
     char port[MAXLINE];
     char path[MAXLINE];
-}URI;
+}URI;  // 统一资源定位符
+
+typedef struct {
+    char uri[MAXLINE];
+    char buf[MAX_OBJECT_SIZE];
+    int n;  //buf的字节大小
+    int timelamp;  // 时间戳：实现LRU算法
+}Act;  // 每个活动
+
+typedef struct {
+    Act act[MAX_OBJECT_NUM];
+    int num;  // 当前缓存多少活动
+}Cache;
+
+static Cache cache;
+static sem_t mutex, w;
+static int readcnt, timelamp;
 
 
 void doit(int fd);
@@ -23,12 +41,97 @@ int read_requesthdrs(rio_t *rp);
 void parse_uri(char *uri, URI *uri_data);
 void build_header(char *server, URI* uri_data, rio_t *rio);
 
+void *thread(void *connfdp);  // 线程例程函数
+
+void init_cache(){
+    cache.num = 0;
+    for(int i = 0; i < MAX_OBJECT_NUM; i++){
+        cache.act[i].n = 0;
+    }
+    Sem_init(&mutex, 0, 1);
+    Sem_init(&w, 0, 1);
+    readcnt = 0;  // 读者数为0
+    timelamp = 0;
+}
+
+// 查看cache
+int query_cache(int connfd, char *uri){
+    P(&mutex);
+    readcnt++;
+    if(readcnt == 1){
+        P(&w);
+    }
+    V(&mutex);
+
+    /* 查找 */
+    int hit_flag = 0; 
+    for(int i = 0; i < MAX_OBJECT_NUM; i++){
+        if(!strcmp(cache.act[i].uri, uri)){
+            // 直接发给客户端
+            P(&mutex);
+            cache.act[i].timelamp = timelamp++;
+            V(&mutex);
+            Rio_writen(connfd, cache.act[i].buf, cache.act[i].n);
+            hit_flag = 1;
+            break;
+        }
+    }
+
+    P(&mutex);
+    readcnt--;
+    if(readcnt == 0){
+        V(&w);
+    }
+    V(&mutex);
+    if(hit_flag){
+        return 1;
+    }
+    return 0;  // 没查到返回0
+}
+
+/* 写cache */
+void write_cache(char *uri, char *buf, int n){
+    P(&w);
+    if(cache.num < MAX_OBJECT_NUM){
+        int id = cache.num;
+        memcpy(cache.act[id].buf, buf, n);
+        strcpy(cache.act[id].uri, uri);
+        cache.act[id].n = n;
+        P(&mutex);
+        cache.act[id].timelamp = timelamp++;
+        V(&mutex);
+        cache.num ++;
+    }
+    else{
+        // 采用LRU替换策略
+        int longest_lamp = timelamp;
+        int idx;
+        for(int i = 0; i < MAX_OBJECT_NUM; i++){
+            if(cache.act[i].timelamp < longest_lamp){
+                longest_lamp = cache.act[i].timelamp;
+                idx = i;
+            }
+        }
+        memcpy(cache.act[idx].buf, buf, n);
+        strcpy(cache.act[idx].uri, uri);
+        cache.act[idx].n = n;
+        P(&mutex);
+        cache.act[idx].timelamp = timelamp++;
+        V(&mutex);
+    }
+    V(&w);
+}
+
 int main(int argc, char **argv) 
 {
-    int listenfd, connfd;
+    // 忽略SIGPIPE信号
+    Signal(SIGPIPE, SIG_IGN);
+
+    int listenfd, *connfdp;
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
+    pthread_t tid;  // 线程id
 
     /* Check command line args */
     if (argc != 2) {
@@ -36,18 +139,20 @@ int main(int argc, char **argv)
 	exit(1);
     }
 
+    /* cache初始化 */
+    init_cache();
+
     listenfd = Open_listenfd(argv[1]);
     while (1) {
-	clientlen = sizeof(clientaddr);
-	connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); //line:netp:tiny:accept
-        Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, 
-                    port, MAXLINE, 0);
+	    clientlen = sizeof(clientaddr);
+        connfdp = Malloc(sizeof(int));  // 这里每次重新分配内存理论上应该可以避免race问题
+        *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen);  //line:netp:tiny:accept
+        Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", hostname, port);
-	doit(connfd);                                             //line:netp:tiny:doit
-	Close(connfd);                                            //line:netp:tiny:close
+        // 分配线程给connfd去处理
+        Pthread_create(&tid, NULL, thread, connfdp);
     }
 }
-/* $end tinymain */
 
 /*
  * doit - receive and send one HTTP request/response transaction
@@ -60,6 +165,7 @@ void doit(int fd)
     char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
     char server[MAXLINE];  //转发给server的数据
     rio_t rio, server_rio;
+    char cache_buf[MAX_OBJECT_SIZE];
 
     /* Read request line and headers */
     Rio_readinitb(&rio, fd);  // connfd是用户与proxy进行connect的套接字
@@ -71,6 +177,11 @@ void doit(int fd)
         printf("Proxy doesn't implement this method\n");
         return ;  //确保只运行GET事务
     }                                                    //line:netp:doit:endrequesterr
+
+    /* 检查cache中是否存在用户所请求的 */
+    if(query_cache(fd, uri)){
+        return ;
+    }
 
     // 解析uri
     URI *uri_data=Malloc(sizeof(URI));
@@ -91,10 +202,16 @@ void doit(int fd)
     Rio_writen(serverfd, server, strlen(server));
 
     // 回复给客户端
-    size_t n;
+    size_t n, cnt = 0;
     while((n = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0){
         printf("Proxy received %d bytes, then send\n", (int)n);
+        memcpy(cache_buf + cnt, buf, n);
+        cnt += n;
         Rio_writen(fd, buf, n);
+    }
+
+    if(cnt < MAX_OBJECT_SIZE){
+        write_cache(uri, cache_buf, cnt);
     }
 
     // 关闭与server连接的proxy自己的描述符/文件句柄
@@ -107,7 +224,7 @@ void doit(int fd)
 /* $begin parse_uri */
 void parse_uri(char *uri, URI *uri_data) 
 {
-    memset(uri_data, 0, sizeof(uri_data));
+    memset(uri_data, 0, sizeof(URI));
     char *hostname = strstr(uri, "//");
     if(!hostname){
         // 没找到主机名
@@ -150,5 +267,16 @@ void build_header(char *server, URI* uri_data, rio_t *rio){
     // Host请求头
     snprintf(host_hdr, MAXLINE, "Host: %s\r\n", uri_data->hostname);
 
+    // server--为完整的http请求
     sprintf(server, "%s%s%s%s%s\r\n", req_line, host_hdr, user_agent_hdr, user_connect_hdr, user_proxy_hdr);
+}
+
+/* Thread routine*/
+void *thread(void *connfdp){  // v_argument_pointor 参数指针
+    int connfd = *((int *)connfdp);
+    Pthread_detach(Pthread_self());  // 线程分离
+    Free(connfdp);
+    doit(connfd);
+    Close(connfd);
+    return NULL;
 }
